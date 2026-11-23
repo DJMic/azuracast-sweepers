@@ -112,7 +112,7 @@ expect(counters == (sweepers.songs_since_jingle(), sweepers.songs_since_sweeper(
 
 def independent_plan(token, counts) =
     (token, {
-        source=source.fail(), ready=true, offset=1., jingle_id=9, duration=1., duck_gain=0.5, song_delay=0.,
+        source=source.fail(), request=request.create("plan.wav"), ready=true, offset=1., jingle_id=9, duration=1., duck_gain=0.5, song_delay=0.,
         follow_spacing=false, counts_spacing=counts
     })
 end
@@ -135,7 +135,7 @@ expect(not sweepers.current("51"), "A queued jingle cancels that song's plan")
 expect(sweepers.current("52"), "Other plans remain valid")
 blocked_overlay = source.fail()
 sweepers.plans := [("51", {
-    source=blocked_overlay, ready=true, offset=1., jingle_id=9, duration=1., duck_gain=0.5, song_delay=0., follow_spacing=true, counts_spacing=true
+    source=blocked_overlay, request=request.create("plan.wav"), ready=true, offset=1., jingle_id=9, duration=1., duck_gain=0.5, song_delay=0., follow_spacing=true, counts_spacing=true
 })]
 sweepers.pending := {source=blocked_overlay, due=1., duck_end=2., token="51"}
 ignore(sweepers.next_overlay())
@@ -145,7 +145,7 @@ sweepers.blocked := []
 
 overlay = source.fail()
 sweepers.plans := [("31", {
-    source=overlay, ready=true, offset=1., jingle_id=9, duration=1., duck_gain=0.5, song_delay=0., follow_spacing=true, counts_spacing=true
+    source=overlay, request=request.create("plan.wav"), ready=true, offset=1., jingle_id=9, duration=1., duck_gain=0.5, song_delay=0., follow_spacing=true, counts_spacing=true
 })]
 sweepers.pending := {source=overlay, due=1., duck_end=2., token="31"}
 test_configure(enabled=false)
@@ -163,6 +163,49 @@ test_configure(enabled=true, minimum_songs=2)
 expect(sweepers.current("31"), "Re-enable without rebuilding the source")
 test_configure(enabled=true, minimum_songs=3)
 expect(sweepers.current("31"), "Other settings changes keep a prepared plan")
+expect(
+    sweepers.with_local_file("annotate:liq_cue_in=\"0\",title=\"a:media:b\":media:Sweepers/one.mp3", "/cache/9.mp3") ==
+        "annotate:liq_cue_in=\"0\",title=\"a:media:b\":/cache/9.mp3",
+    "Only the media path is replaced in an annotated URI"
+)
+expect(sweepers.with_local_file("media:Sweepers/one.mp3", "/cache/9.mp3") == "/cache/9.mp3", "A bare media URI becomes the local copy")
+expect(sweepers.cache_stem({media_id=9, identity="abc:100:200:hash"}) == "9-abc-100-200", "Cache names follow the media identity")
+expect(sweepers.playable_uri(9, "media:one.mp3") == "media:one.mp3", "Local storage plays sweepers in place")
+
+cache_root = file.temp_dir("sweepers-cache-", "")
+settings.azuracast.temp_path := cache_root
+settings.azuracast.media_path := "api"
+source_file = "#{cache_root}/download.wav"
+file.write(data="audio", source_file)
+job = {media_id=9, identity="abc:100:200:hash", uri="annotate:liq_cue_in=\"0\":media:one.wav"}
+expect(sweepers.playable_uri(9, "annotate:liq_cue_in=\"0\":media:one.wav") == "", "Remote sweepers are never downloaded while planning")
+expect(sweepers.store(job, source_file), "A downloaded sweeper is kept")
+cached_path = "#{cache_root}/sweepers/9-abc-100-200.wav"
+expect(file.exists(cached_path) and not file.exists("#{cached_path}.part"), "The local copy is complete")
+expect(sweepers.cached_file(job) == cached_path, "A kept copy is found again after a restart")
+expect(sweepers.playable_uri(9, "annotate:liq_cue_in=\"0\":media:one.wav") == "annotate:liq_cue_in=\"0\":#{cached_path}",
+    "Remote sweepers play from their local copy")
+file.write(data="stale", "#{cache_root}/sweepers/8-old-1-1.wav")
+sweepers.measurements := [{
+    media_id=9, identity="abc:100:200:hash", source="provided", autocue="",
+    metadata={liq_cue_in="0", liq_cue_out="1", liq_cross_start_next="", liq_fade_out="", liq_amplify="",
+        liq_normalize_track_gain="", autocue_cue_in="", autocue_cue_out="", autocue_start_next="", autocue_fade_out=""}
+}]
+sweepers.keep_cache([job])
+expect(not file.exists("#{cache_root}/sweepers/8-old-1-1.wav"), "Copies of removed sweepers are deleted")
+expect(file.exists(cached_path), "Current copies are kept")
+file.remove(cached_path)
+sweepers.keep_cache([job])
+expect(sweepers.cached() == [] and sweepers.measurements() == [], "A vanished copy is measured again")
+settings.azuracast.media_path := "/var/azuracast/stations/test/media"
+
+released_request = request.create("released.wav")
+sweepers.plans := [("41", {
+    source=source.fail(), request=released_request, ready=true, offset=1., jingle_id=9, duration=1., duck_gain=0.5,
+    song_delay=0., follow_spacing=true, counts_spacing=true
+})]
+sweepers.notify("release", "41")
+expect(sweepers.plans() == [], "A released plan is removed")
 print("Song spacing checks passed.")
 
 thread.run(delay=0.1, {shutdown()})
