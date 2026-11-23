@@ -110,7 +110,7 @@ end
 
 # A played request is freed by its queue; any other plan would keep its request forever.
 def sweepers.discard(token) =
-    pending = if null.defined(sweepers.pending()) then null.get(sweepers.pending()).token else ""
+    pending = if null.defined(sweepers.pending()) then null.get(sweepers.pending()).token else "" end
     if token != sweepers.active() and token != pending and list.assoc.mem(token, sweepers.plans()) then
         request.destroy(list.assoc(token, sweepers.plans()).request)
     end
