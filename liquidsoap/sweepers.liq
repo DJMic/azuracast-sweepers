@@ -268,6 +268,10 @@ def sweepers.remote_media() =
     settings.azuracast.media_path() == "api"
 end
 
+def sweepers.downloaded(uri) =
+    sweepers.remote_media() and (string.contains(prefix="media:", uri) or string.contains(substring="\":media:", uri))
+end
+
 def sweepers.cache_dir() =
     "#{settings.azuracast.temp_path()}/sweepers"
 end
@@ -360,7 +364,7 @@ def sweepers.keep_cache(jobs) =
 end
 
 def sweepers.playable_uri(jingle_id, uri) =
-    if not sweepers.remote_media() then
+    if not sweepers.downloaded(uri) then
         uri
     else
         local = list.filter(fun (c) -> c.media_id == jingle_id and file.exists(c.path), sweepers.cached())
@@ -396,12 +400,13 @@ def sweepers.record(job, r) =
 end
 
 def sweepers.measure(job) =
-    cached = if sweepers.remote_media() then sweepers.cached_file(job) else "" end
+    remote = sweepers.downloaded(job.uri)
+    cached = if remote then sweepers.cached_file(job) else "" end
     r = request.create(if cached != "" then sweepers.with_local_file(job.uri, cached) else job.uri end)
     try
         if request.resolve(timeout=10., r) then
             kept =
-                if not sweepers.remote_media() then true
+                if not remote then true
                 elsif cached != "" then
                     sweepers.remember_cached(job, cached)
                     true

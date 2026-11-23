@@ -170,6 +170,8 @@ expect(
 )
 expect(sweepers.with_local_file("media:Sweepers/one.mp3", "/cache/9.mp3") == "/cache/9.mp3", "A bare media URI becomes the local copy")
 expect(sweepers.cache_stem({media_id=9, identity="abc:100:200:hash"}) == "9-abc-100-200", "Cache names follow the media identity")
+expect(sweepers.playable_uri(9, "/music/one.mp3") == "/music/one.mp3", "Plain file URIs play in place")
+settings.azuracast.media_path := "/var/azuracast/stations/test/media"
 expect(sweepers.playable_uri(9, "media:one.mp3") == "media:one.mp3", "Local storage plays sweepers in place")
 
 cache_root = file.temp_dir("sweepers-cache-", "")
