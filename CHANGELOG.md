@@ -7,6 +7,8 @@
 - **Remote media storage:** sweepers are downloaded once into the station's temporary folder
   and played from that copy, so preparing the next song no longer waits on a storage download
   and the AutoDJ no longer drops tracks under load. Unused sweeper requests are released.
+- **Song spacing with Jingle Mode:** songs separated by jingles now count towards "Songs without
+  sweeper after a sweeper", so alternating song/jingle rotations keep receiving sweepers.
 
 ### Update notes
 

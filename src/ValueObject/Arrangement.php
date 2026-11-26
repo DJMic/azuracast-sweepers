@@ -148,6 +148,7 @@ final class Arrangement
             $song = $row['media_id'] !== null && !$isJingle($row);
             if ($isJingle($row)) {
                 $sinceJingle = 0;
+                $sinceSweeper += $previousClear ? 1 : 0;
             } elseif (!$song) {
                 $sinceJingle = 0;
                 $sinceSweeper = 0;

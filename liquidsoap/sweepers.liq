@@ -148,9 +148,10 @@ def sweepers.spacing(m) =
         if not is_song then 0
         elsif sweepers.previous_song() then min(1000, sweepers.songs_since_jingle() + 1)
         else sweepers.songs_since_jingle() end
+    # A clear song is counted when the next track starts, whether that track is a song or a jingle.
     since_sweeper =
         if not is_song and not is_jingle then 0
-        elsif is_song and sweepers.previous_clear() then min(1000, sweepers.songs_since_sweeper() + 1)
+        elsif sweepers.previous_clear() then min(1000, sweepers.songs_since_sweeper() + 1)
         else sweepers.songs_since_sweeper() end
     s = sweepers.settings()
     reason =
