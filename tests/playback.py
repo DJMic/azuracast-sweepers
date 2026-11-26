@@ -22,7 +22,8 @@ parser.add_argument('--scenario', choices=['normal', 'skip', 'live', 'live-switc
                                           'before-jingle', 'computed-autocue', 'provided-autocue', 'station-autocue',
                                           'amplify-off', 'replaygain', 'arrange', 'reverb',
                                           'plan-retry', 'plan-lost-response', 'heartbeat-outage',
-                                          'reverb-pending', 'reverb-skip', 'pre-roll', 'independent-spacing'], default='normal')
+                                          'reverb-pending', 'reverb-skip', 'pre-roll', 'independent-spacing', 'remote-storage'],
+                    default='normal')
 parser.add_argument('--runtime', type=Path, required=True)
 args = parser.parse_args()
 plugin = Path(__file__).resolve().parents[1]
@@ -31,7 +32,8 @@ live_switch = args.scenario.startswith('live-switch')
 takeover_delay = 1.6 if args.scenario == 'live-switch' else .8
 spacing = args.scenario in ('spacing', 'playlist-spacing', 'independent-spacing')
 autocue = args.scenario in ('computed-autocue', 'provided-autocue', 'station-autocue', 'amplify-off', 'replaygain')
-short_tracks = spacing or autocue or args.scenario in ('hot-enable', 'arrange', 'heartbeat-outage')
+remote = args.scenario == 'remote-storage'
+short_tracks = spacing or autocue or remote or args.scenario in ('hot-enable', 'arrange', 'heartbeat-outage')
 warmup_duration = .5 if autocue else .1
 
 
@@ -96,9 +98,18 @@ with tempfile.TemporaryDirectory(prefix='sweepers-playback-') as temporary:
                     jingle = ('jingle_mode="true",' if args.scenario == 'spacing' else 'playlist_id="7",') if spacing and song_requests <= 2 else ''
                     duration = 1.2 if short_tracks else 8
                     value = {'uri': f'annotate:liq_disable_autocue="true",sq_id="{token}",{jingle}media_id="1",liq_cue_in="0",liq_cue_out="{duration}":{root}/song.wav'}
+            elif self.path == '/cp':
+                # AzuraCast's remote storage hands out a fresh temporary download for every request.
+                source = root / json.loads(body)['uri']
+                download = root / f'download-{len(calls)}{source.suffix}'
+                download.write_bytes(source.read_bytes())
+                value = {'uri': str(download), 'isTemp': True}
             elif self.path == '/sweepers/catalog':
                 time.sleep(1.5)
                 value = []
+                if remote:
+                    value = [{'media_id': 9, 'identity': 'u9:100:200:hash', 'uri': (
+                        'annotate:liq_disable_autocue="true",liq_cue_in="0",liq_cue_out="0.5":media:sweeper.wav')}]
                 if args.scenario in ('computed-autocue', 'station-autocue'):
                     value = [{'media_id': 9, 'identity': 'cued', 'uri': f'{root}/cued.wav'}]
                 elif autocue:
@@ -116,7 +127,9 @@ with tempfile.TemporaryDirectory(prefix='sweepers-playback-') as temporary:
                                  duck_duration=4., gain=1., duck_gain=.4467)
                 else:
                     value = dict(token=token, jingle_id=9, revision=live_settings['revision'],
-                                 uri=f'annotate:liq_cue_in="0",liq_cue_out="{0.5 if short_tracks else 2}":{root}/sweeper.wav' if short_tracks or token == '123' else '',
+                                 uri=f'annotate:liq_cue_in="0",liq_cue_out="{0.5 if short_tracks else 2}":'
+                                     + ('media:sweeper.wav' if remote else f'{root}/sweeper.wav')
+                                     if short_tracks or token == '123' else '',
                                  offset=.1 if short_tracks else (3. if args.scenario in ('skip', 'hot-pending', 'hot-change', 'before-jingle', 'reverb-pending', 'reverb-skip') else 1.),
                                  duck_duration=.3 if short_tracks else 1., gain=1., duck_gain=.4467,
                                  **({'reverb': 1., 'length': 2.} if args.scenario.startswith('reverb') else {}),
@@ -174,7 +187,9 @@ end)
 '''
     station = {'station-autocue': 'settings.azuracast.compute_autocue := true',
                'amplify-off': 'settings.azuracast.apply_amplify := false',
-               'replaygain': 'enable_replaygain_metadata()'}.get(args.scenario, '')
+               'replaygain': 'enable_replaygain_metadata()',
+               'remote-storage': f'''settings.azuracast.media_path := "api"
+settings.azuracast.temp_path := {json.dumps(str(root / 'temp'))}'''}.get(args.scenario, '')
     live_source = '''live_ready = ref(false)
 live = source.available(sine(1320.), {live_ready()})''' if live_switch else ''
     live_fallback = '''radio_without_live = radio
@@ -352,6 +367,15 @@ thread.run(delay={shutdown_delay}, {{shutdown()}})
             assert amplitude(samples, 880, at) < 50, ('Unexpected sweeper', token)
         at = onset + (126 - metadata[0]) * 1.2 + .25
         assert amplitude(samples, 880, at) > 5000, 'Allowed sweeper missing'
+    elif remote:
+        downloads = [body for path, body, _ in calls if path == '/cp']
+        assert downloads == [{'uri': 'sweeper.wav'}], ('A remote sweeper must be downloaded exactly once', downloads)
+        assert (root / 'temp' / 'sweepers' / '9-u9-100-200.wav').exists(), 'The local sweeper copy is missing'
+        played = {e['token'] for e in events if e['event'] == 'played'}
+        assert played, ('Remote sweepers must play from their local copy', result.stdout[-2000:])
+        for token in played:
+            at = onset + (int(token) - metadata[0]) * 1.2 + .25
+            assert amplitude(samples, 880, at) > 5000, ('Reported sweeper inaudible', token)
     elif args.scenario == 'hot-enable':
         played = {e['token'] for e in events if e['event'] == 'played'}
         assert played, 'Enabling did not activate sweepers without a restart'

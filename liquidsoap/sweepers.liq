@@ -18,6 +18,7 @@ let sweepers.events = ref([])
 let sweepers.measurements = ref([])
 let sweepers.catalog = ref([])
 let sweepers.attempted = ref([])
+let sweepers.cached = ref([])
 let sweepers.catalog_at = ref(-60.)
 let sweepers.started = ref(false)
 let sweepers.settings = ref({
@@ -107,6 +108,14 @@ def sweepers.event(~jingle_id=0, ~offset=0., event, token, detail, m) =
     sweepers.atomic(fun () -> sweepers.events := list.prefix(128, [e, ...sweepers.events()]))
 end
 
+# A played request is freed by its queue; any other plan would keep its request forever.
+def sweepers.discard(token) =
+    pending = if null.defined(sweepers.pending()) then null.get(sweepers.pending()).token else "" end
+    if token != sweepers.active() and token != pending and list.assoc.mem(token, sweepers.plans()) then
+        request.destroy(list.assoc(token, sweepers.plans()).request)
+    end
+end
+
 def sweepers.notify(~detail="", ~jingle_id=0, ~offset=0., ~metadata=[], event, token) =
     if token != "" then
         if event == "played" then
@@ -117,6 +126,9 @@ def sweepers.notify(~detail="", ~jingle_id=0, ~offset=0., ~metadata=[], event, t
             end
         end
         sweepers.event(jingle_id=jingle_id, offset=offset, event, token, detail, metadata)
+        if event != "played" then
+            sweepers.discard(token)
+        end
         sweepers.atomic(fun () -> sweepers.plans := list.assoc.remove(token, sweepers.plans()))
     end
 end
@@ -251,6 +263,162 @@ def sweepers.compute_autocue(m, filename) =
     end
 end
 
+# With remote storage every media request downloads through AzuraCast, so sweepers are kept as local copies.
+def sweepers.remote_media() =
+    settings.azuracast.media_path() == "api"
+end
+
+def sweepers.downloaded(uri) =
+    sweepers.remote_media() and (string.contains(prefix="media:", uri) or string.contains(substring="\":media:", uri))
+end
+
+def sweepers.cache_dir() =
+    "#{settings.azuracast.temp_path()}/sweepers"
+end
+
+def sweepers.cache_stem(job) =
+    version = string.concat(separator="-", list.prefix(3, string.split(separator=":", job.identity)))
+    "#{job.media_id}-#{version}"
+end
+
+def sweepers.cache_files() =
+    try
+        file.ls(absolute=true, sweepers.cache_dir())
+    catch err do
+        log(level=4, label="sweepers", "No sweeper cache yet: #{error.message(err)}")
+        []
+    end
+end
+
+def sweepers.cached_file(job) =
+    stem = sweepers.cache_stem(job)
+    files = list.filter(fun (f) -> path.remove_extension(path.basename(f)) == stem, sweepers.cache_files())
+    if files == [] then "" else list.hd(files) end
+end
+
+# Annotations end with a quoted value, so the last match separates them from the media path.
+def sweepers.with_local_file(uri, local) =
+    marker = "\":media:"
+    parts = string.split(separator=marker, uri)
+    if list.length(parts) >= 2 then
+        annotations = string.concat(separator=marker, list.prefix(list.length(parts) - 1, parts))
+        "#{annotations}\":#{local}"
+    else
+        local
+    end
+end
+
+def sweepers.forget_cached(c) =
+    sweepers.cached := list.filter(fun (e) -> e.media_id != c.media_id, sweepers.cached())
+    sweepers.measurements := list.filter(fun (m) -> m.identity != c.identity, sweepers.measurements())
+    sweepers.attempted := list.assoc.remove(c.identity, sweepers.attempted())
+end
+
+def sweepers.remember_cached(job, local) =
+    sweepers.cached := [
+        {media_id=job.media_id, identity=job.identity, path=local},
+        ...list.filter(fun (e) -> e.media_id != job.media_id, sweepers.cached())
+    ]
+end
+
+# Writes beside the target first so a reader never sees a partial file.
+def sweepers.copy_file(original, target) =
+    partial = "#{target}.part"
+    file.copy(original, partial)
+    file.move(atomic=true, partial, target)
+end
+
+def sweepers.store(job, filename) =
+    try
+        file.mkdir(parents=true, sweepers.cache_dir())
+        local = "#{sweepers.cache_dir()}/#{sweepers.cache_stem(job)}#{file.extension(filename)}"
+        sweepers.copy_file(filename, local)
+        sweepers.remember_cached(job, local)
+        true
+    catch err do
+        log(label="sweepers", "Sweeper #{job.media_id} not cached: #{error.message(err)}")
+        false
+    end
+end
+
+# AzuraCast deletes station temp files after two days unless they are rewritten.
+def sweepers.keep_cache(jobs) =
+    identities = list.map(fun (j) -> j.identity, jobs)
+    list.iter(fun (c) -> begin
+        if not list.mem(c.identity, identities) or not file.exists(c.path) then
+            sweepers.forget_cached(c)
+        elsif time() - file.mtime(c.path) > 86400. then
+            try
+                sweepers.copy_file(c.path, c.path)
+            catch err do
+                log(label="sweepers", "Sweeper cache not refreshed: #{error.message(err)}")
+            end
+        end
+    end, sweepers.cached())
+    stems = list.map(sweepers.cache_stem, jobs)
+    list.iter(fun (f) -> begin
+        if not list.mem(path.remove_extension(path.basename(f)), stems) then
+            try file.remove(f) catch err do log(label="sweepers", "Stale sweeper copy kept: #{error.message(err)}") end
+        end
+    end, sweepers.cache_files())
+end
+
+def sweepers.playable_uri(jingle_id, uri) =
+    if not sweepers.downloaded(uri) then
+        uri
+    else
+        local = list.filter(fun (c) -> c.media_id == jingle_id and file.exists(c.path), sweepers.cached())
+        if local == [] then "" else sweepers.with_local_file(uri, list.hd(local).path) end
+    end
+end
+
+def sweepers.record(job, r) =
+    resolved = request.metadata(r)
+    provided = ((resolved["liq_cue_in"] != "" or resolved["autocue_cue_in"] != "") and
+        (resolved["liq_cue_out"] != "" or resolved["autocue_cue_out"] != ""))
+    m = if provided then resolved else sweepers.compute_autocue(resolved, request.filename(r)) end
+    origin = if provided then "provided" elsif m["autocue_cue_out"] != "" then "computed" else "none" end
+    if origin == "computed" then
+        loudness = if sweepers.fallback_loudness(resolved) then "normalized" else "unchanged" end
+        log(label="sweepers", "AutoCue computed for sweeper #{job.media_id}: AzuraCast supplied no cue values; loudness #{loudness} like songs")
+    elsif origin == "none" then
+        log(label="sweepers", "No cue values for sweeper #{job.media_id}; it will not be used")
+    end
+    sweepers.measurements := [{
+        media_id=job.media_id, identity=job.identity, source=origin,
+        autocue=if origin == "computed" then "internal" else m["liq_autocue"] end,
+        metadata={
+            liq_cue_in=m["liq_cue_in"], liq_cue_out=m["liq_cue_out"],
+            liq_cross_start_next=m["liq_cross_start_next"], liq_fade_out=m["liq_fade_out"],
+            liq_amplify=if settings.azuracast.apply_amplify() then m["liq_amplify"] else "" end,
+            liq_normalize_track_gain=m[settings.normalize_track_gain_metadata()],
+            autocue_cue_in=m["autocue_cue_in"],
+            autocue_cue_out=m["autocue_cue_out"], autocue_start_next=m["autocue_start_next"],
+            autocue_fade_out=m["autocue_fade_out"]
+        }
+    }, ...sweepers.measurements()]
+end
+
+def sweepers.measure(job) =
+    remote = sweepers.downloaded(job.uri)
+    cached = if remote then sweepers.cached_file(job) else "" end
+    r = request.create(if cached != "" then sweepers.with_local_file(job.uri, cached) else job.uri end)
+    try
+        if request.resolve(timeout=10., r) then
+            kept =
+                if not remote then true
+                elsif cached != "" then
+                    sweepers.remember_cached(job, cached)
+                    true
+                else sweepers.store(job, request.filename(r)) end
+            if kept then sweepers.record(job, r) end
+        end
+    catch err do
+        log(label="sweepers", "Catalogue item skipped: #{error.message(err)}")
+    end
+    request.destroy(r)
+end
+
 def sweepers.refresh_catalog() =
     try
         # Settings changes reset catalog_at.
@@ -263,48 +431,20 @@ def sweepers.refresh_catalog() =
                 identities = list.map(fun (j) -> j.identity, jobs)
                 sweepers.measurements := list.filter(fun (m) -> list.mem(m.identity, identities), sweepers.measurements())
                 sweepers.attempted := list.filter(fun (a) -> list.mem(fst(a), identities), sweepers.attempted())
+                if sweepers.remote_media() then sweepers.keep_cache(jobs) end
             end
         end
+        # Each failed remote attempt is a full download, so it waits longer.
+        retry = if sweepers.remote_media() then 300. else 60. end
         missing = list.filter(fun (job) -> begin
             measured = list.exists(fun (m) -> m.identity == job.identity, sweepers.measurements())
             attempted = list.assoc(default=0., job.identity, sweepers.attempted())
-            not measured and time() - attempted >= 60.
+            not measured and time() - attempted >= retry
         end, sweepers.catalog())
         if missing != [] then
             job = list.hd(missing)
             sweepers.attempted := [(job.identity, time()), ...list.assoc.remove(job.identity, sweepers.attempted())]
-            r = request.create(job.uri)
-            try
-                if request.resolve(timeout=10., r) then
-                    resolved = request.metadata(r)
-                    provided = ((resolved["liq_cue_in"] != "" or resolved["autocue_cue_in"] != "") and
-                        (resolved["liq_cue_out"] != "" or resolved["autocue_cue_out"] != ""))
-                    m = if provided then resolved else sweepers.compute_autocue(resolved, request.filename(r)) end
-                    origin = if provided then "provided" elsif m["autocue_cue_out"] != "" then "computed" else "none" end
-                    if origin == "computed" then
-                        loudness = if sweepers.fallback_loudness(resolved) then "normalized" else "unchanged" end
-                        log(label="sweepers", "AutoCue computed for sweeper #{job.media_id}: AzuraCast supplied no cue values; loudness #{loudness} like songs")
-                    elsif origin == "none" then
-                        log(label="sweepers", "No cue values for sweeper #{job.media_id}; it will not be used")
-                    end
-                    sweepers.measurements := [{
-                        media_id=job.media_id, identity=job.identity, source=origin,
-                        autocue=if origin == "computed" then "internal" else m["liq_autocue"] end,
-                        metadata={
-                            liq_cue_in=m["liq_cue_in"], liq_cue_out=m["liq_cue_out"],
-                            liq_cross_start_next=m["liq_cross_start_next"], liq_fade_out=m["liq_fade_out"],
-                            liq_amplify=if settings.azuracast.apply_amplify() then m["liq_amplify"] else "" end,
-                            liq_normalize_track_gain=m[settings.normalize_track_gain_metadata()],
-                            autocue_cue_in=m["autocue_cue_in"],
-                            autocue_cue_out=m["autocue_cue_out"], autocue_start_next=m["autocue_start_next"],
-                            autocue_fade_out=m["autocue_fade_out"]
-                        }
-                    }, ...sweepers.measurements()]
-                end
-            catch err do
-                log(label="sweepers", "Catalogue item skipped: #{error.message(err)}")
-            end
-            request.destroy(r)
+            sweepers.measure(job)
         end
     catch err do
         log(label="sweepers", "Catalogue refresh skipped: #{error.message(err)}")
@@ -433,18 +573,25 @@ def sweepers.next_song() =
                             duck_duration: float, gain: float, duck_gain: float, reverb?: float, length?: float
                         }) = null.get(response())
                         ready = ref(false)
+                        prepared = ref(null)
+                        jingle_id = null.get(default=0, p?.jingle_id)
+                        uri = if p.uri != "" then sweepers.playable_uri(jingle_id, p.uri) else "" end
                         overlay = source.fail()
                         overlay =
-                            if p.uri != "" and sweepers.current(p.token) then
-                                jr = request.create(resolve_metadata=false, p.uri)
+                            if uri == "" and p.uri != "" and sweepers.current(p.token) then
+                                log(label="sweepers", "Sweeper #{jingle_id} skipped for queue #{p.token}: no local copy yet")
+                                sweepers.notify(detail="unavailable", "release", p.token)
+                                overlay
+                            elsif p.uri != "" and sweepers.current(p.token) then
+                                jr = request.create(resolve_metadata=false, uri)
                                 if request.resolve(timeout=1., jr) then
+                                    prepared := jr
                                     ready := true
                                     s = amplify(override=null, p.gain, request.once(jr))
                                     s.on_track(synchronous=true, fun (_) -> begin
                                         if sweepers.active() == p.token then
                                             sweepers.notify(
-                                                jingle_id=null.get(default=0, p?.jingle_id),
-                                                offset=p.offset, metadata=m, "played", p.token
+                                                jingle_id=jingle_id, offset=p.offset, metadata=m, "played", p.token
                                             )
                                         else
                                             log(level=2, label="sweepers", "Inactive sweeper source started for queue #{p.token}")
@@ -473,13 +620,14 @@ def sweepers.next_song() =
                             end
                             list.iter(fun (entry) -> sweepers.notify("release", fst(entry)), list.slice(offset=15, sweepers.plans()))
                             plan = {
-                                source=overlay, ready=true, offset=p.offset, jingle_id=null.get(default=0, p?.jingle_id),
+                                source=overlay, request=null.get(prepared()), ready=true, offset=p.offset, jingle_id=jingle_id,
                                 duration=p.duck_duration, duck_gain=p.duck_gain, song_delay=song_delay,
                                 follow_spacing=null.get(default=true, p?.follow_spacing),
                                 counts_spacing=null.get(default=true, p?.counts_for_spacing)
                             }
                             sweepers.atomic(fun () -> sweepers.plans := [(token, plan), ...list.assoc.remove(token, sweepers.plans())])
                         elsif ready() then
+                            request.destroy(null.get(prepared()))
                             sweepers.notify(detail=sweepers.stale_reason(p.token), "release", p.token)
                         end
                     else

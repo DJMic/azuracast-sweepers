@@ -1,5 +1,17 @@
 # Release notes
 
+## 2.0.3 - Pending testing approval
+
+### Fixes
+
+- **Remote media storage:** sweepers are downloaded once into the station's temporary folder
+  and played from that copy, so preparing the next song no longer waits on a storage download
+  and the AutoDJ no longer drops tracks under load. Unused sweeper requests are released.
+
+### Update notes
+
+- **AzuraCast Broadcast (Liquidsoap) restart: Required**; the Liquidsoap module changed.
+
 ## 2.0.2 - 2026-11-10
 
 ### Fixes
