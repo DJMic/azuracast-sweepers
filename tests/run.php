@@ -573,6 +573,14 @@ $due = ['songs_since_jingle' => 5, 'songs_since_sweeper' => 5, 'previous_song' =
 $gapSettings = new Settings(playlistIds: [9], songsAfterJingle: 1, songsAfterSweeper: 1);
 $intros = static fn(int ...$ids): Closure => static fn(int $media): bool => in_array($media, $ids, true);
 check(
+    Arrangement::playing(
+        [$song(30, true, extra: ['is_jingle' => true]), $song(31, true, extra: ['planned' => true])],
+        ['songs_since_jingle' => 0, 'songs_since_sweeper' => 0, 'previous_song' => true, 'previous_clear' => true],
+        new Settings(songsAfterJingle: 0, songsAfterSweeper: 1)
+    ) === ['31'],
+    'A clear song followed by a jingle counts towards the sweeper gap.'
+);
+check(
     Arrangement::choose([$song(21), $song(22), $song(23)], $due, $gapSettings, 3, $intros(23)) === [21, 23],
     'A due sweeper on a song without intro moves the first later song with one forward.'
 );
